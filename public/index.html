@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Razorpay Booking Demo</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background-color: #f4f4f4;
+            margin: 0;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+            text-align: center;
+            max-width: 400px;
+        }
+        button {
+            background-color: #528FF0;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            font-size: 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 20px;
+        }
+        button:hover {
+            background-color: #4079d1;
+        }
+        #status {
+            margin-top: 20px;
+            font-weight: bold;
+        }
+        .SUCCESS { color: green; }
+        .FAILED { color: red; }
+        .TIMEOUT { color: orange; }
+        .ABANDONED { color: gray; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h2>Booking Demo</h2>
+        <p>Book your slot for ₹500</p>
+        <button id="rzp-button1">Book Now</button>
+        <div id="status"></div>
+    </div>
+
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+    <script>
+        const statusDiv = document.getElementById('status');
+        let keyId = '';
+
+        // Fetch key from server
+        fetch('/get-razorpay-key').then(res => res.json()).then(data => {
+            keyId = data.keyId;
+        });
+
+        function updateStatus(status, message) {
+            statusDiv.className = status;
+            statusDiv.innerText = `${status}: ${message}`;
+        }
+
+        document.getElementById('rzp-button1').onclick = async function (e) {
+            e.preventDefault();
+            
+            // Clear previous status
+            updateStatus('', 'Initiating payment...');
+            
+            try {
+                // 1. Create order on the server
+                const response = await fetch('/create-order', { method: 'POST' });
+                const order = await response.json();
+                
+                if (!order || !order.id) {
+                    updateStatus('FAILED', 'Could not create order on the server.');
+                    return;
+                }
+
+                // 2. Initialize Razorpay Checkout
+                const options = {
+                    "key": keyId, 
+                    "amount": order.amount, 
+                    "currency": "INR",
+                    "name": "Booking Demo",
+                    "description": "Test Transaction",
+                    "order_id": order.id, 
+                    "handler": async function (response) {
+                        // SUCCESS SCENARIO
+                        try {
+                            const verifyRes = await fetch('/verify-payment', {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(response)
+                            });
+                            
+                            const verifyData = await verifyRes.json();
+                            
+                            if (verifyData.status === 'SUCCESS') {
+                                updateStatus('SUCCESS', 'Payment successful and verified!');
+                            } else {
+                                updateStatus('FAILED', 'Payment successful but verification failed.');
+                            }
+                        } catch (err) {
+                            // TIMEOUT / UNKNOWN SCENARIO
+                            // This could happen if the network drops right after payment success
+                            updateStatus('TIMEOUT', 'Payment status unknown. Could not reach server to verify.');
+                        }
+                    },
+                    "prefill": {
+                        "name": "Test User",
+                        "email": "test@example.com",
+                        "contact": "9999999999"
+                    },
+                    "theme": {
+                        "color": "#528FF0"
+                    },
+                    "modal": {
+                        "ondismiss": function() {
+                            // ABANDONED SCENARIO
+                            updateStatus('ABANDONED', 'User closed the checkout modal.');
+                        }
+                    }
+                };
+                
+                const rzp1 = new Razorpay(options);
+                
+                // FAILED SCENARIO
+                rzp1.on('payment.failed', function (response){
+                    console.error("Payment Failed:", response.error);
+                    updateStatus('FAILED', response.error.description || 'Payment Failed');
+                });
+                
+                rzp1.open();
+                
+            } catch (error) {
+                console.error("Error:", error);
+                updateStatus('FAILED', 'An error occurred while setting up the payment.');
+            }
+        }
+    </script>
+</body>
+</html>

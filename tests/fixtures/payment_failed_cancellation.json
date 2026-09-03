@@ -1,0 +1,32 @@
+{
+  "id": "evt_test_cancellation_001",
+  "entity": "event",
+  "account_id": "acc_test",
+  "event": "payment.failed",
+  "contains": ["payment"],
+  "created_at": 1693000000,
+  "payload": {
+    "payment": {
+      "entity": {
+        "id": "pay_TWNYAiJhT1wvzF",
+        "entity": "payment",
+        "amount": 50000,
+        "currency": "INR",
+        "status": "failed",
+        "order_id": "order_TWNY4MfPJudIBV",
+        "method": "wallet",
+        "wallet": "mobikwik",
+        "captured": false,
+        "email": "test@example.com",
+        "contact": "9999999999",
+        "error_code": "BAD_REQUEST_ERROR",
+        "error_description": "Your payment has been cancelled. Try again or complete the payment later.",
+        "error_reason": "payment_cancelled",
+        "error_source": "customer",
+        "error_step": "payment_authentication",
+        "amount_refunded": 0,
+        "created_at": 1693000000
+      }
+    }
+  }
+}

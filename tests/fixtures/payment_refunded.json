@@ -1,0 +1,29 @@
+{
+  "id": "evt_test_refunded_001",
+  "entity": "event",
+  "account_id": "acc_test",
+  "event": "payment.refunded",
+  "contains": ["payment"],
+  "created_at": 1693000300,
+  "payload": {
+    "payment": {
+      "entity": {
+        "id": "pay_TWNUWNZQK4eU4S",
+        "entity": "payment",
+        "amount": 50000,
+        "currency": "INR",
+        "status": "refunded",
+        "order_id": "order_TWNUN3xgPdwaz4",
+        "method": "wallet",
+        "wallet": "airtelmoney",
+        "captured": true,
+        "email": "captured_test@example.com",
+        "contact": "9777777777",
+        "fee": 1180,
+        "amount_refunded": 50000,
+        "refund_status": "full",
+        "created_at": 1693000200
+      }
+    }
+  }
+}

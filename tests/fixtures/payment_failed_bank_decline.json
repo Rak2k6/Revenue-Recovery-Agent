@@ -1,0 +1,32 @@
+{
+  "id": "evt_test_bankdecline_001",
+  "entity": "event",
+  "account_id": "acc_test",
+  "event": "payment.failed",
+  "contains": ["payment"],
+  "created_at": 1693000100,
+  "payload": {
+    "payment": {
+      "entity": {
+        "id": "pay_TWNbzkLLUmS96u",
+        "entity": "payment",
+        "amount": 50000,
+        "currency": "INR",
+        "status": "failed",
+        "order_id": "order_TWNbqxTBoLD8rC",
+        "method": "netbanking",
+        "bank": "IOBA",
+        "captured": false,
+        "email": "bank_test@example.com",
+        "contact": "9888888888",
+        "error_code": "BAD_REQUEST_ERROR",
+        "error_description": "Your payment didn't go through as it was declined by the bank. Try another payment method or contact your bank.",
+        "error_reason": "payment_failed",
+        "error_source": "bank",
+        "error_step": "payment_authorization",
+        "amount_refunded": 0,
+        "created_at": 1693000100
+      }
+    }
+  }
+}

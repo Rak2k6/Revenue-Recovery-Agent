@@ -1,0 +1,176 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── ENUMS ────────────────────────────────────────────────────────────────────
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum FailureCategory {
+  CUSTOMER_ABANDONMENT
+  BANK_DECLINE
+  GATEWAY_FAILURE
+  AUTHENTICATION_FAILURE
+  INSUFFICIENT_FUNDS
+  INVALID_PAYMENT_DETAILS
+  TIMEOUT
+  RISK_REJECTION
+  UNKNOWN
+}
+
+enum RecoverabilityStatus {
+  PENDING_ASSESSMENT
+  RECOVERABLE
+  NOT_RECOVERABLE
+  RECOVERED
+  RECOVERY_FAILED
+}
+
+enum ActionStatus {
+  NONE
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  SKIPPED
+}
+
+// ─── CUSTOMER ─────────────────────────────────────────────────────────────────
+
+model Customer {
+  id        String    @id @default(cuid())
+  email     String?   @unique
+  contact   String?
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+
+  payments  Payment[]
+
+  @@map("customers")
+}
+
+// ─── PAYMENT ──────────────────────────────────────────────────────────────────
+
+model Payment {
+  id                String        @id @default(cuid())
+  razorpayPaymentId String        @unique @map("razorpay_payment_id")
+  razorpayOrderId   String?       @map("razorpay_order_id")
+
+  customerId        String?       @map("customer_id")
+  customer          Customer?     @relation(fields: [customerId], references: [id])
+
+  amount            Int           // stored in paise to avoid floating-point bugs
+  currency          String        @default("INR")
+  method            String?
+  status            PaymentStatus
+  captured          Boolean       @default(false)
+  bank              String?
+  wallet            String?
+
+  errorCode         String?       @map("error_code")
+  errorDescription  String?       @map("error_description")
+  errorSource       String?       @map("error_source")
+  errorStep         String?       @map("error_step")
+  errorReason       String?       @map("error_reason")
+
+  amountRefunded    Int           @default(0) @map("amount_refunded")
+  refundStatus      String?       @map("refund_status")
+
+  // Separate timestamps: when Razorpay created the payment vs. when we stored it
+  razorpayCreatedAt DateTime?     @map("razorpay_created_at")
+  createdAt         DateTime      @default(now()) @map("created_at")
+  updatedAt         DateTime      @updatedAt @map("updated_at")
+
+  recoveryCase      RecoveryCase?
+
+  @@map("payments")
+}
+
+// ─── WEBHOOK EVENT ────────────────────────────────────────────────────────────
+
+model WebhookEvent {
+  id              String    @id @default(cuid())
+  // idempotencyKey: razorpayEventId if present, else "{eventType}:{paymentId}"
+  // The UNIQUE constraint here is what makes concurrent-safe idempotency work.
+  // We INSERT and catch a unique-constraint violation; no SELECT-then-INSERT race.
+  idempotencyKey  String    @unique @map("idempotency_key")
+
+  razorpayEventId String?   @map("razorpay_event_id") // retained for debugging
+  eventType       String    @map("event_type")
+  payload         Json      // raw Razorpay payload retained for audit/replay
+  signatureVerified Boolean @map("signature_verified")
+  processed       Boolean   @default(false)
+  processedAt     DateTime? @map("processed_at")
+
+  // Two distinct timestamps per user correction:
+  // receivedAt = when our server got the HTTP request
+  // createdAt  = when the DB row was inserted (should be ~same, but tracked separately)
+  receivedAt      DateTime  @map("received_at")
+  createdAt       DateTime  @default(now()) @map("created_at")
+
+  @@map("webhook_events")
+}
+
+// ─── RECOVERY CASE ────────────────────────────────────────────────────────────
+
+model RecoveryCase {
+  id                   String               @id @default(cuid())
+  paymentId            String               @unique @map("payment_id")
+  payment              Payment              @relation(fields: [paymentId], references: [id])
+
+  failureCategory      FailureCategory      @default(UNKNOWN) @map("failure_category")
+  revenueAtRisk        Int                  @map("revenue_at_risk") // in paise
+  recoverabilityStatus RecoverabilityStatus @default(PENDING_ASSESSMENT) @map("recoverability_status")
+
+  // Milestone 2 fields
+  recoveryProbability  Float?               @map("recovery_probability")
+  priority             String?              @map("priority")
+  recommendedAction    String?              @map("recommended_action")
+  preferredMethod      String?              @map("preferred_method")
+  reasoning            String?              @map("reasoning")
+  confidence           Float?               @map("confidence")
+  stopCondition        String?              @map("stop_condition")
+  actionStatus         ActionStatus         @default(NONE) @map("action_status")
+  recoveryAttemptCount Int                  @default(0) @map("recovery_attempt_count")
+  maxRecoveryAttempts  Int                  @default(3) @map("max_recovery_attempts")
+
+  // Milestone 3 fields
+  recoveryLinkId       String?              @map("recovery_link_id")
+  recoveryLinkUrl      String?              @map("recovery_link_url")
+  amountRecovered      Int                  @default(0) @map("amount_recovered") // in paise
+
+  createdAt            DateTime             @default(now()) @map("created_at")
+  updatedAt            DateTime             @updatedAt @map("updated_at")
+
+  auditLogs            RecoveryAuditLog[]
+
+  @@map("recovery_cases")
+}
+
+// ─── RECOVERY AUDIT LOG ───────────────────────────────────────────────────────
+
+model RecoveryAuditLog {
+  id              String       @id @default(cuid())
+  recoveryCaseId  String       @map("recovery_case_id")
+  recoveryCase    RecoveryCase @relation(fields: [recoveryCaseId], references: [id])
+
+  action          String       // e.g. "SEND_RETRY_LINK", "MARK_NOT_RECOVERABLE"
+  status          ActionStatus
+  amountRecovered Int?         @map("amount_recovered") // in paise
+  metadata        Json?        // AI output, Razorpay API response, etc.
+
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  @@map("recovery_audit_logs")
+}
