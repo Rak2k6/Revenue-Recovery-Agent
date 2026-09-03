@@ -124,12 +124,52 @@ recoveryCasesRouter.post('/recovery-cases/:id/assess', requireInternalKey, async
 });
 
 import { executeRecoveryAction } from '../recovery/actionExecutor';
+import { buildRecoveryContext } from '../recovery/contextBuilder';
+import { decideWithLLM } from '../recovery/llmAgent';
+import { evaluateRecoveryPolicy } from '../recovery/policyEngine';
 
-/** POST /recovery-cases/:id/execute — execute approved recovery decision */
+/**
+ * POST /recovery-cases/:id/execute
+ *
+ * Runs the full Phase 2C→2D→2E→2F pipeline:
+ *   RecoveryCase → RecoveryContext → LLM → PolicyDecision → Executor → Outcome
+ *
+ * Only an approved PolicyDecision may trigger a Razorpay call.
+ */
 recoveryCasesRouter.post('/recovery-cases/:id/execute', requireInternalKey, async (req: Request, res: Response) => {
   const recoveryCaseId = req.params.id as string;
-  const result = await executeRecoveryAction(recoveryCaseId);
-  res.json(result);
+
+  try {
+    // Phase 2C: Build validated RecoveryContext
+    const context = await buildRecoveryContext(recoveryCaseId);
+
+    // Phase 2D: Obtain LLM recommendation (always returns a valid decision — may be STOP fallback)
+    const llmDecision = await decideWithLLM(context);
+
+    // Phase 2E: Deterministic Policy Engine — authorises or stops the action
+    const policyDecision = evaluateRecoveryPolicy(context, llmDecision);
+
+    // Phase 2F: Execute only if approved
+    const result = await executeRecoveryAction(recoveryCaseId, policyDecision, context);
+
+    res.json({
+      ...result,
+      pipeline: {
+        llmAction: llmDecision.recommended_action,
+        llmConfidence: llmDecision.confidence,
+        policyApproved: policyDecision.approved,
+        policyAction: policyDecision.action,
+        policyReason: policyDecision.reason,
+        stopCondition: policyDecision.stopCondition,
+      },
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      recoveryCaseId,
+      error: err?.message || 'Internal server error during recovery execution.',
+    });
+  }
 });
 
 /** GET /recovery-metrics — calculate recovery metrics */

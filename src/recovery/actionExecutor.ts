@@ -1,7 +1,12 @@
+import { RecoveryCase, Payment } from '@prisma/client';
 import { prisma } from '../db/prismaClient';
-import { decideRecoveryAction } from './decisionEngine';
-import { validateRecoveryDecision } from './policyGuardrail';
 import { createPaymentLink } from '../integrations/razorpay/paymentLink';
+import { PolicyDecision } from './schemas/policyDecisionSchema';
+import { RecoveryContext } from './schemas/recoveryContextSchema';
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 export interface ExecutionResult {
   success: boolean;
@@ -17,10 +22,93 @@ export interface ExecutionResult {
   error?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+async function logAudit(
+  recoveryCaseId: string,
+  action: string,
+  status: 'COMPLETED' | 'FAILED' | 'SKIPPED' | 'IN_PROGRESS',
+  metadata: Record<string, unknown>
+): Promise<void> {
+  await prisma.recoveryAuditLog.create({
+    data: { recoveryCaseId, action, status, metadata: metadata as any },
+  });
+}
+
+function rejectedResult(
+  recoveryCaseId: string,
+  action: string,
+  reason: string
+): ExecutionResult {
+  return {
+    success: false,
+    recoveryCaseId,
+    action,
+    status: 'SKIPPED',
+    error: `Execution blocked: ${reason}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main executor
+// ---------------------------------------------------------------------------
+
+/**
+ * Phase 2F Action Executor.
+ *
+ * This executor ONLY accepts an already-approved PolicyDecision.
+ * It does NOT call decisionEngine, policyGuardrail, Groq, or any LLM.
+ * The Policy Engine is the authorisation boundary; the executor protects
+ * against stale state and race conditions.
+ *
+ * @param recoveryCaseId  ID of the RecoveryCase to operate on.
+ * @param policyDecision  Validated PolicyDecision from Phase 2E. If not
+ *                        approved, no side effects occur.
+ * @param context         The RecoveryContext used to produce the decision
+ *                        (provides trusted amounts and customer flags).
+ */
 export async function executeRecoveryAction(
-  recoveryCaseId: string
+  recoveryCaseId: string,
+  policyDecision: PolicyDecision,
+  context: RecoveryContext
 ): Promise<ExecutionResult> {
-  // 1. Load RecoveryCase with payment and customer
+
+  // ── Guard 1: Policy rejection ─────────────────────────────────────────────
+  if (!policyDecision.approved) {
+    await logAudit(recoveryCaseId, 'EXECUTION_REJECTED', 'SKIPPED', {
+      action: policyDecision.action,
+      reason: policyDecision.reason,
+      stopCondition: policyDecision.stopCondition,
+    });
+    return {
+      success: false,
+      recoveryCaseId,
+      action: policyDecision.action,
+      status: 'SKIPPED',
+      message: policyDecision.reason,
+    };
+  }
+
+  const approvedAction = policyDecision.action;
+
+  // ── NO_ACTION / STOP: no side effects ────────────────────────────────────
+  if (approvedAction === 'NO_ACTION' || approvedAction === 'STOP') {
+    await logAudit(recoveryCaseId, 'EXECUTION_NO_ACTION', 'SKIPPED', {
+      action: approvedAction,
+      reason: policyDecision.reason,
+    });
+    return {
+      success: true,
+      recoveryCaseId,
+      action: approvedAction,
+      status: 'SKIPPED',
+      message: policyDecision.reason,
+    };
+  }
+
+  // ── Load fresh RecoveryCase (re-read to guard against stale state) ───────
   const recoveryCase = await prisma.recoveryCase.findUnique({
     where: { id: recoveryCaseId },
     include: { payment: { include: { customer: true } } },
@@ -30,7 +118,7 @@ export async function executeRecoveryAction(
     return {
       success: false,
       recoveryCaseId,
-      action: 'NONE',
+      action: approvedAction,
       status: 'FAILED',
       error: 'RecoveryCase or Payment not found.',
     };
@@ -38,25 +126,17 @@ export async function executeRecoveryAction(
 
   const payment = recoveryCase.payment;
 
-  // 2. Check Idempotency: If a link already exists, return existing link without re-creating
+  // ── Idempotency check: already has a recovery link ────────────────────────
   if (recoveryCase.recoveryLinkId && recoveryCase.recoveryLinkUrl) {
-    await prisma.recoveryAuditLog.create({
-      data: {
-        recoveryCaseId: recoveryCase.id,
-        action: 'ACTION_ALREADY_EXISTS',
-        status: 'COMPLETED',
-        metadata: {
-          recoveryLinkId: recoveryCase.recoveryLinkId,
-          recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
-          message: 'Payment link already created previously.',
-        },
-      },
+    await logAudit(recoveryCaseId, 'ACTION_ALREADY_EXISTS', 'COMPLETED', {
+      recoveryLinkId: recoveryCase.recoveryLinkId,
+      recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+      message: 'Payment link already created; returning existing link.',
     });
-
     return {
       success: true,
       recoveryCaseId: recoveryCase.id,
-      action: 'CREATE_PAYMENT_LINK',
+      action: approvedAction,
       status: 'COMPLETED',
       paymentLink: {
         id: recoveryCase.recoveryLinkId,
@@ -67,69 +147,81 @@ export async function executeRecoveryAction(
     };
   }
 
-  // 3. Perform pre-execution validations
+  // ── Executor-side invariant checks (stale-state protection) ──────────────
   if (payment.status !== 'FAILED') {
-    await logBlocked(recoveryCase.id, 'Payment status is not FAILED.');
-    return blockResult(recoveryCase.id, 'Payment is not in FAILED state.');
-  }
-
-  if (recoveryCase.recoverabilityStatus !== 'RECOVERABLE' && recoveryCase.recoverabilityStatus !== 'PENDING_ASSESSMENT') {
-    await logBlocked(recoveryCase.id, 'RecoveryCase is not recoverable.');
-    return blockResult(recoveryCase.id, 'Case is not marked recoverable.');
+    await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
+      reason: 'Payment status is not FAILED.',
+      paymentStatus: payment.status,
+    });
+    return rejectedResult(recoveryCaseId, approvedAction, 'Payment is not in FAILED state.');
   }
 
   if (recoveryCase.revenueAtRisk <= 0) {
-    await logBlocked(recoveryCase.id, 'Revenue at risk is 0 or less.');
-    return blockResult(recoveryCase.id, 'No revenue at risk.');
+    await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
+      reason: 'Revenue at risk is 0 or less.',
+      revenueAtRisk: recoveryCase.revenueAtRisk,
+    });
+    return rejectedResult(recoveryCaseId, approvedAction, 'No revenue at risk.');
   }
 
   if (recoveryCase.recoveryAttemptCount >= recoveryCase.maxRecoveryAttempts) {
-    await logBlocked(recoveryCase.id, `Max recovery attempts (${recoveryCase.maxRecoveryAttempts}) reached.`);
-    return blockResult(recoveryCase.id, 'Max recovery attempts exceeded.');
-  }
-
-  // Retrieve customer history to get decision
-  let customerPayments: any[] = [];
-  if (payment.customerId) {
-    customerPayments = await prisma.payment.findMany({
-      where: { customerId: payment.customerId },
+    await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
+      reason: `Max recovery attempts (${recoveryCase.maxRecoveryAttempts}) reached.`,
+      current: recoveryCase.recoveryAttemptCount,
     });
+    return rejectedResult(recoveryCaseId, approvedAction, `Max recovery attempts exceeded.`);
   }
 
-  const decision = decideRecoveryAction(recoveryCase, payment, customerPayments);
-
-  if (decision.recommendedAction !== 'CREATE_PAYMENT_LINK') {
-    await logBlocked(recoveryCase.id, `Recommended action '${decision.recommendedAction}' is not supported for execution.`);
-    return blockResult(recoveryCase.id, `Unsupported or non-executable action: ${decision.recommendedAction}`);
+  // ── SEND_RECOVERY_REMINDER (MVP) ──────────────────────────────────────────
+  // Only valid when an existing link is already present. The idempotency
+  // guard above handles the case where recoveryLinkId already exists and the
+  // LLM requested a reminder. If the executor reaches here for a reminder
+  // request but no link exists, the policy engine should have already blocked
+  // it; however we defensively handle it here too.
+  if (approvedAction === 'SEND_RECOVERY_REMINDER') {
+    if (!recoveryCase.recoveryLinkUrl) {
+      await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
+        reason: 'No existing recovery link to remind customer about.',
+      });
+      return rejectedResult(recoveryCaseId, approvedAction, 'No existing recovery link available for reminder.');
+    }
+    // MVP: log that a reminder would be sent; no actual notification system.
+    await logAudit(recoveryCaseId, 'RECOVERY_REMINDER_NOTED', 'COMPLETED', {
+      message: 'Recovery reminder noted. No external notification system is configured in this MVP.',
+      existingRecoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+    });
+    return {
+      success: true,
+      recoveryCaseId: recoveryCase.id,
+      action: approvedAction,
+      status: 'COMPLETED',
+      message: 'Recovery reminder acknowledged (no external notification in MVP).',
+      revenueAtRisk: recoveryCase.revenueAtRisk,
+    };
   }
 
-  // Run policy guardrail validation immediately before execution
-  const guardrail = validateRecoveryDecision(decision, recoveryCase, payment);
-  if (!guardrail.allowed) {
-    await logBlocked(recoveryCase.id, guardrail.reason || 'Policy guardrail failed.');
-    return blockResult(recoveryCase.id, guardrail.reason || 'Blocked by policy guardrail.');
-  }
+  // ── CREATE_PAYMENT_LINK execution ─────────────────────────────────────────
+  // Only this action reaches Razorpay. Amount MUST come from the trusted
+  // RecoveryCase, never from the LLM decision.
 
-  // 4. Atomic Lock / Claim Mechanism for Concurrency Control
+  // Atomic claim: transition NONE/PENDING/FAILED → IN_PROGRESS
   const claimResult = await prisma.recoveryCase.updateMany({
     where: {
-      id: recoveryCase.id,
+      id: recoveryCaseId,
       actionStatus: { notIn: ['IN_PROGRESS', 'COMPLETED'] },
       recoveryLinkId: null,
     },
-    data: {
-      actionStatus: 'IN_PROGRESS',
-    },
+    data: { actionStatus: 'IN_PROGRESS' },
   });
 
   if (claimResult.count === 0) {
-    // Re-check if another concurrent request completed it or is in progress
-    const freshCase = await prisma.recoveryCase.findUnique({ where: { id: recoveryCase.id } });
+    // Another concurrent process may have claimed or completed it.
+    const freshCase = await prisma.recoveryCase.findUnique({ where: { id: recoveryCaseId } });
     if (freshCase?.recoveryLinkId && freshCase?.recoveryLinkUrl) {
       return {
         success: true,
         recoveryCaseId: freshCase.id,
-        action: 'CREATE_PAYMENT_LINK',
+        action: approvedAction,
         status: 'COMPLETED',
         paymentLink: {
           id: freshCase.recoveryLinkId,
@@ -139,35 +231,38 @@ export async function executeRecoveryAction(
         message: 'Existing recovery payment link returned (idempotent concurrent claim).',
       };
     }
-    await logBlocked(recoveryCase.id, 'Action already IN_PROGRESS or COMPLETED by concurrent request.');
-    return blockResult(recoveryCase.id, 'Action is already in progress or completed.');
+    await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
+      reason: 'Action already IN_PROGRESS or COMPLETED by a concurrent request.',
+    });
+    return rejectedResult(recoveryCaseId, approvedAction, 'Action is already in progress or completed.');
   }
 
-  // Audit ACTION_REQUESTED
-  await prisma.recoveryAuditLog.create({
-    data: {
-      recoveryCaseId: recoveryCase.id,
-      action: 'ACTION_REQUESTED',
-      status: 'IN_PROGRESS',
-      metadata: { action: 'CREATE_PAYMENT_LINK' },
-    },
+  // Audit: execution requested and claimed
+  await logAudit(recoveryCaseId, 'ACTION_REQUESTED', 'IN_PROGRESS', {
+    action: approvedAction,
+    policyReason: policyDecision.reason,
+    revenueAtRisk: recoveryCase.revenueAtRisk,
+    confidence: context.recovery.baselineRecoveryProbability,
   });
 
-  // 5. Call Razorpay API to create Payment Link
+  // ── Razorpay Payment Link creation ───────────────────────────────────────
+  // IMPORTANT: The amount is taken from the trusted RecoveryCase, NOT the LLM.
+  // Customer details come from the verified payment record, NOT the LLM.
   try {
     const linkResult = await createPaymentLink({
       amount: recoveryCase.revenueAtRisk,
-      description: `Revenue Recovery for Payment ${payment.razorpayPaymentId}`,
+      description: `Revenue Recovery — Payment ${payment.razorpayPaymentId}`,
       referenceId: recoveryCase.id,
-      customerEmail: payment.customer?.email,
-      customerContact: payment.customer?.contact,
+      // PII from payment record only — never from LLM output
+      customerEmail: payment.customer?.email ?? null,
+      customerContact: payment.customer?.contact ?? null,
       notes: {
         paymentId: payment.id,
         razorpayPaymentId: payment.razorpayPaymentId,
       },
     });
 
-    // 6. Update RecoveryCase status upon success
+    // Persist success
     await prisma.recoveryCase.update({
       where: { id: recoveryCase.id },
       data: {
@@ -180,18 +275,11 @@ export async function executeRecoveryAction(
       },
     });
 
-    // Audit PAYMENT_LINK_CREATED
-    await prisma.recoveryAuditLog.create({
-      data: {
-        recoveryCaseId: recoveryCase.id,
-        action: 'PAYMENT_LINK_CREATED',
-        status: 'COMPLETED',
-        metadata: {
-          paymentLinkId: linkResult.id,
-          shortUrl: linkResult.shortUrl,
-          status: linkResult.status,
-        },
-      },
+    await logAudit(recoveryCaseId, 'PAYMENT_LINK_CREATED', 'COMPLETED', {
+      paymentLinkId: linkResult.id,
+      shortUrl: linkResult.shortUrl,
+      status: linkResult.status,
+      revenueAtRisk: recoveryCase.revenueAtRisk,
     });
 
     return {
@@ -206,10 +294,17 @@ export async function executeRecoveryAction(
       revenueAtRisk: recoveryCase.revenueAtRisk,
       message: 'Recovery payment link created.',
     };
+
   } catch (error: any) {
-    const sanitizedError = error?.message || error?.description || 'Failed to create payment link via Razorpay API.';
-    
-    // Update RecoveryCase status to FAILED and increment attempt count
+    // NOTE: Residual failure mode — if Razorpay succeeded but the DB update
+    // below fails, the next call will not find recoveryLinkId and could
+    // attempt a second link creation. The Razorpay reference_id (=recoveryCaseId)
+    // is idempotent on the Razorpay side but their API does not expose a
+    // reliable fetch-by-reference_id endpoint in the current SDK version.
+    // For MVP we document this limitation and rely on the atomic DB claim.
+    const sanitizedError =
+      error?.message || error?.description || 'Failed to create payment link via Razorpay API.';
+
     await prisma.recoveryCase.update({
       where: { id: recoveryCase.id },
       data: {
@@ -218,16 +313,9 @@ export async function executeRecoveryAction(
       },
     });
 
-    // Audit ACTION_FAILED
-    await prisma.recoveryAuditLog.create({
-      data: {
-        recoveryCaseId: recoveryCase.id,
-        action: 'ACTION_FAILED',
-        status: 'FAILED',
-        metadata: {
-          error: sanitizedError,
-        },
-      },
+    await logAudit(recoveryCaseId, 'ACTION_FAILED', 'FAILED', {
+      error: sanitizedError,
+      paymentId: payment.id,
     });
 
     return {
@@ -238,25 +326,4 @@ export async function executeRecoveryAction(
       error: sanitizedError,
     };
   }
-}
-
-async function logBlocked(recoveryCaseId: string, reason: string) {
-  await prisma.recoveryAuditLog.create({
-    data: {
-      recoveryCaseId,
-      action: 'ACTION_BLOCKED',
-      status: 'SKIPPED',
-      metadata: { reason },
-    },
-  });
-}
-
-function blockResult(recoveryCaseId: string, reason: string): ExecutionResult {
-  return {
-    success: false,
-    recoveryCaseId,
-    action: 'CREATE_PAYMENT_LINK',
-    status: 'SKIPPED',
-    error: `Execution blocked: ${reason}`,
-  };
 }

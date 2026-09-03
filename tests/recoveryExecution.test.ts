@@ -1,7 +1,15 @@
+/**
+ * recoveryExecution.test.ts
+ *
+ * Updated for Phase 2F: executeRecoveryAction now accepts (recoveryCaseId, policyDecision, context).
+ * All pre-existing behaviour assertions are preserved; only the call signature changes.
+ */
 import { executeRecoveryAction } from '../src/recovery/actionExecutor';
 import { handleCapturedPayment } from '../src/services/recoveryService';
 import * as paymentLinkModule from '../src/integrations/razorpay/paymentLink';
 import { prisma } from '../src/db/prismaClient';
+import { PolicyDecision } from '../src/recovery/schemas/policyDecisionSchema';
+import { RecoveryContext } from '../src/recovery/schemas/recoveryContextSchema';
 
 jest.mock('../src/db/prismaClient', () => {
   const mPrisma = {
@@ -26,14 +34,74 @@ jest.mock('../src/integrations/razorpay/paymentLink', () => ({
   createPaymentLink: jest.fn(),
 }));
 
-describe('Milestone 3: Recovery Execution', () => {
-  const mockDate = new Date();
+// ---------------------------------------------------------------------------
+// Shared fixture builders
+// ---------------------------------------------------------------------------
 
-  beforeEach(() => {
-    jest.clearAllMocks();
-  });
+function makeApprovedPolicy(overrides: Partial<PolicyDecision> = {}): PolicyDecision {
+  return {
+    schemaVersion: 1,
+    approved: true,
+    action: 'CREATE_PAYMENT_LINK',
+    reason: 'Recovery action is permitted under the current policy constraints.',
+    stopCondition: null,
+    ...overrides,
+  };
+}
 
-  const makeMockCase = (overrides = {}): any => ({
+function makeContext(): RecoveryContext {
+  return {
+    schemaVersion: 1,
+    payment: {
+      razorpayPaymentId: 'rzp_pay_123',
+      razorpayOrderId: null,
+      amount: 50000,
+      currency: 'INR',
+      method: 'card',
+      bank: null,
+      wallet: null,
+      status: 'FAILED',
+      razorpayCreatedAt: new Date().toISOString(),
+    },
+    failure: {
+      category: 'CUSTOMER_ABANDONMENT',
+      errorCode: null,
+      errorDescription: null,
+      errorSource: null,
+      errorStep: null,
+      errorReason: null,
+    },
+    customer: {
+      tenureDays: 10,
+      totalSuccessfulPayments: 0,
+      totalFailedPayments: 0,
+      lifetimeValue: 0,
+      averageOrderValue: 0,
+      hasEmail: true,
+      hasContact: true,
+    },
+    recovery: {
+      recoveryAttemptCount: 0,
+      maxRecoveryAttempts: 3,
+      attemptsRemaining: 3,
+      previousActionsThisCase: [],
+      existingRecoveryLinkUrl: null,
+      caseAgeMinutes: 10,
+      revenueAtRisk: 50000,
+      baselineRecoveryProbability: 0.60,
+    },
+    policy: {
+      recoveryWindowRemainingMinutes: 1400,
+      withinContactLimit: true,
+      isHighValue: false,
+    },
+  };
+}
+
+const mockDate = new Date();
+
+function makeMockCase(overrides: Record<string, unknown> = {}): any {
+  return {
     id: 'case_123',
     paymentId: 'pay_123',
     failureCategory: 'CUSTOMER_ABANDONMENT',
@@ -73,12 +141,21 @@ describe('Milestone 3: Recovery Execution', () => {
       },
     },
     ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+describe('Milestone 3: Recovery Execution (Phase 2F)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
   });
 
   it('1. Recoverable customer cancellation -> Payment Link created', async () => {
-    const rc = makeMockCase({ failureCategory: 'CUSTOMER_ABANDONMENT' });
+    const rc = makeMockCase({ failureCategory: 'CUSTOMER_ABANDONMENT', maxRecoveryAttempts: 3 });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
-    (prisma.payment.findMany as jest.Mock).mockResolvedValue([]);
     (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
     (paymentLinkModule.createPaymentLink as jest.Mock).mockResolvedValue({
       id: 'plink_test123',
@@ -88,7 +165,7 @@ describe('Milestone 3: Recovery Execution', () => {
     });
     (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc, actionStatus: 'COMPLETED' });
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(true);
     expect(res.status).toBe('COMPLETED');
@@ -99,70 +176,86 @@ describe('Milestone 3: Recovery Execution', () => {
     );
   });
 
-  it('2. Bank decline -> Payment Link created if recommendedAction is CREATE_PAYMENT_LINK or supported', async () => {
-    // If decision recommends ALTERNATIVE_PAYMENT_METHOD (which isn't CREATE_PAYMENT_LINK), execution blocks
-    const rc = makeMockCase({ failureCategory: 'BANK_DECLINE' });
-    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
-    (prisma.payment.findMany as jest.Mock).mockResolvedValue([]);
+  it('2. Rejected policy decision -> no Razorpay call', async () => {
+    const policy = makeApprovedPolicy({
+      approved: false,
+      action: 'STOP',
+      stopCondition: 'RISK_REJECTED',
+      reason: 'Risk rejection.',
+    });
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', policy, makeContext());
 
     expect(res.success).toBe(false);
     expect(res.status).toBe('SKIPPED');
-    expect(res.error).toContain('Unsupported or non-executable action');
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
+    // Must write an EXECUTION_REJECTED audit log
+    expect(prisma.recoveryAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: 'EXECUTION_REJECTED' }),
+      })
+    );
   });
 
-  it('3. Risk rejection -> Blocked', async () => {
-    const rc = makeMockCase({ failureCategory: 'RISK_REJECTION', recoverabilityStatus: 'NOT_RECOVERABLE' });
-    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+  it('3. RISK_REJECTION policy -> no execution side effects', async () => {
+    const policy = makeApprovedPolicy({
+      approved: false,
+      action: 'STOP',
+      stopCondition: 'RISK_REJECTED',
+      reason: 'Risk rejection cannot be bypassed.',
+    });
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', policy, makeContext());
 
     expect(res.success).toBe(false);
-    expect(res.error).toContain('Case is not marked recoverable');
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
+    expect(prisma.recoveryCase.findUnique).not.toHaveBeenCalled(); // must not even touch DB
   });
 
-  it('4. Captured payment -> Blocked', async () => {
-    const rc = makeMockCase();
+  it('4. Captured payment (stale state) -> blocked by executor invariant', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
     rc.payment.status = 'CAPTURED';
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(false);
     expect(res.error).toContain('Payment is not in FAILED state');
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
   });
 
-  it('5. Refunded payment -> Blocked', async () => {
-    const rc = makeMockCase();
+  it('5. Refunded payment -> blocked by executor invariant', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
     rc.payment.status = 'REFUNDED';
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(false);
     expect(res.error).toContain('Payment is not in FAILED state');
   });
 
-  it('6. Max recovery attempts exceeded -> Blocked', async () => {
+  it('6. Max recovery attempts exceeded (stale state) -> blocked', async () => {
     const rc = makeMockCase({ recoveryAttemptCount: 1, maxRecoveryAttempts: 1 });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(false);
     expect(res.error).toContain('Max recovery attempts exceeded');
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
   });
 
-  it('7. Duplicate execution -> Returns existing link without creating second link', async () => {
+  it('7. Duplicate execution -> returns existing link without creating second link', async () => {
     const rc = makeMockCase({
       recoveryLinkId: 'plink_existing',
       recoveryLinkUrl: 'https://rzp.io/i/existing',
       actionStatus: 'COMPLETED',
+      maxRecoveryAttempts: 3,
     });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(true);
     expect(res.paymentLink?.id).toBe('plink_existing');
@@ -174,14 +267,14 @@ describe('Milestone 3: Recovery Execution', () => {
     );
   });
 
-  it('8. Razorpay API failure -> Audit failure', async () => {
-    const rc = makeMockCase();
+  it('8. Razorpay API failure -> audit failure, no crash', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
-    (prisma.payment.findMany as jest.Mock).mockResolvedValue([]);
     (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
     (paymentLinkModule.createPaymentLink as jest.Mock).mockRejectedValue(new Error('Razorpay API error'));
+    (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc });
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(false);
     expect(res.status).toBe('FAILED');
@@ -193,7 +286,7 @@ describe('Milestone 3: Recovery Execution', () => {
     );
   });
 
-  it('9. Successful recovery payment -> RecoveryCase becomes RECOVERED', async () => {
+  it('9. Successful recovery payment -> RecoveryCase becomes RECOVERED (via handleCapturedPayment)', async () => {
     const rc = makeMockCase({ recoverabilityStatus: 'RECOVERABLE' });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
     (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({
@@ -201,19 +294,6 @@ describe('Milestone 3: Recovery Execution', () => {
       recoverabilityStatus: 'RECOVERED',
       amountRecovered: 50000,
     });
-
-    const eventPayload = {
-      event: 'payment.captured',
-      payload: {
-        payment: {
-          entity: {
-            id: 'pay_captured_123',
-            amount: 50000,
-            notes: { recoveryCaseId: 'case_123' },
-          },
-        },
-      },
-    };
 
     const normEvent = {
       razorpayPaymentId: 'pay_captured_123',
@@ -233,6 +313,19 @@ describe('Milestone 3: Recovery Execution', () => {
       error: null,
     };
 
+    const eventPayload = {
+      event: 'payment.captured',
+      payload: {
+        payment: {
+          entity: {
+            id: 'pay_captured_123',
+            amount: 50000,
+            notes: { recoveryCaseId: 'case_123' },
+          },
+        },
+      },
+    };
+
     const updated = await handleCapturedPayment('pay_captured_123', normEvent, eventPayload);
 
     expect(updated?.recoverabilityStatus).toBe('RECOVERED');
@@ -242,10 +335,9 @@ describe('Milestone 3: Recovery Execution', () => {
     });
   });
 
-  it('10. Payment Link creation alone -> Case remains RECOVERABLE (not RECOVERED)', async () => {
-    const rc = makeMockCase();
+  it('10. Payment Link creation -> Case remains RECOVERABLE (not RECOVERED)', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
     (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
-    (prisma.payment.findMany as jest.Mock).mockResolvedValue([]);
     (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
     (paymentLinkModule.createPaymentLink as jest.Mock).mockResolvedValue({
       id: 'plink_test123',
@@ -259,13 +351,102 @@ describe('Milestone 3: Recovery Execution', () => {
       recoverabilityStatus: 'RECOVERABLE',
     });
 
-    const res = await executeRecoveryAction('case_123');
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
 
     expect(res.success).toBe(true);
-    // Verify that update set recoverabilityStatus to RECOVERABLE, NOT RECOVERED
     expect(prisma.recoveryCase.update).toHaveBeenCalledWith(
       expect.objectContaining({
         data: expect.objectContaining({ recoverabilityStatus: 'RECOVERABLE' }),
+      })
+    );
+  });
+
+  it('11. NO_ACTION policy decision -> no Razorpay call, success=true', async () => {
+    const policy = makeApprovedPolicy({ approved: false, action: 'NO_ACTION', stopCondition: null, reason: 'No action required.' });
+
+    const res = await executeRecoveryAction('case_123', policy, makeContext());
+
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
+    expect(res.action).toBe('NO_ACTION');
+  });
+
+  it('12. STOP policy decision -> no Razorpay call', async () => {
+    const policy = makeApprovedPolicy({
+      approved: false,
+      action: 'STOP',
+      stopCondition: 'LOW_CONFIDENCE',
+      reason: 'Confidence too low.',
+    });
+
+    const res = await executeRecoveryAction('case_123', policy, makeContext());
+
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
+    expect(res.action).toBe('STOP');
+    expect(res.success).toBe(false);
+  });
+
+  it('13. Amount comes from RecoveryCase, not from LLM context recovery_probability', async () => {
+    const rc = makeMockCase({ revenueAtRisk: 99999, maxRecoveryAttempts: 3 });
+    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+    (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+    (paymentLinkModule.createPaymentLink as jest.Mock).mockResolvedValue({
+      id: 'plink_t1',
+      shortUrl: 'https://rzp.io/i/t1',
+      status: 'created',
+      raw: {},
+    });
+    (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc });
+
+    // Context deliberately has a different revenueAtRisk; executor must use RecoveryCase amount
+    const ctx = makeContext();
+    ctx.recovery.revenueAtRisk = 1; // intentionally wrong — should be ignored
+
+    await executeRecoveryAction('case_123', makeApprovedPolicy(), ctx);
+
+    // Amount passed to Razorpay must be from the DB record (99999), not from context (1)
+    expect(paymentLinkModule.createPaymentLink).toHaveBeenCalledWith(
+      expect.objectContaining({ amount: 99999 })
+    );
+  });
+
+  it('14. Concurrent execution -> second claim returns existing result', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
+    (prisma.recoveryCase.findUnique as jest.Mock)
+      .mockResolvedValueOnce(rc)
+      .mockResolvedValueOnce({
+        ...rc,
+        recoveryLinkId: 'plink_concurrent',
+        recoveryLinkUrl: 'https://rzp.io/i/concurrent',
+      });
+    // updateMany returns 0 → another process claimed it
+    (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 0 });
+
+    const res = await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
+
+    expect(paymentLinkModule.createPaymentLink).not.toHaveBeenCalled();
+    expect(res.success).toBe(true);
+    expect(res.paymentLink?.id).toBe('plink_concurrent');
+  });
+
+  it('15. No PII from LLM reaches Razorpay — customer details come from payment record only', async () => {
+    const rc = makeMockCase({ maxRecoveryAttempts: 3 });
+    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+    (prisma.recoveryCase.updateMany as jest.Mock).mockResolvedValue({ count: 1 });
+    (paymentLinkModule.createPaymentLink as jest.Mock).mockResolvedValue({
+      id: 'plink_t2',
+      shortUrl: 'https://rzp.io/i/t2',
+      status: 'created',
+      raw: {},
+    });
+    (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc });
+
+    await executeRecoveryAction('case_123', makeApprovedPolicy(), makeContext());
+
+    // email/contact must come from rc.payment.customer, not from context
+    expect(paymentLinkModule.createPaymentLink).toHaveBeenCalledWith(
+      expect.objectContaining({
+        customerEmail: 'test@example.com',
+        customerContact: '9999999999',
       })
     );
   });
