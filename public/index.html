@@ -1,150 +1,344 @@
 <!DOCTYPE html>
 <html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Razorpay Booking Demo</title>
-    <style>
-        body {
-            font-family: Arial, sans-serif;
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            height: 100vh;
-            background-color: #f4f4f4;
-            margin: 0;
-        }
-        .container {
-            background: white;
-            padding: 30px;
-            border-radius: 8px;
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-            text-align: center;
-            max-width: 400px;
-        }
-        button {
-            background-color: #528FF0;
-            color: white;
-            border: none;
-            padding: 10px 20px;
-            font-size: 16px;
-            border-radius: 4px;
-            cursor: pointer;
-            margin-top: 20px;
-        }
-        button:hover {
-            background-color: #4079d1;
-        }
-        #status {
-            margin-top: 20px;
-            font-weight: bold;
-        }
-        .SUCCESS { color: green; }
-        .FAILED { color: red; }
-        .TIMEOUT { color: orange; }
-        .ABANDONED { color: gray; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>Booking Demo</h2>
-        <p>Book your slot for ₹500</p>
-        <button id="rzp-button1">Book Now</button>
-        <div id="status"></div>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Revenue Recovery</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-block">
+          <div class="brand-mark">R</div>
+          <div>
+            <div class="brand-label">Razorpay</div>
+            <div class="brand-name">AI Revenue Recovery</div>
+          </div>
+        </div>
+
+        <nav class="sidebar-nav" aria-label="Main navigation">
+          <a class="nav-item active" href="#overview">Overview</a>
+          <a class="nav-item" href="#recovery-cases">Recovery Cases</a>
+          <a class="nav-item" href="#batch-recovery">Batch Recovery</a>
+          <a class="nav-item" href="#audit-trail">Audit Trail</a>
+        </nav>
+
+        <div class="sidebar-status">
+          <span class="status-indicator"></span>
+          <span>System Status</span>
+        </div>
+        <div class="sidebar-status muted">● Operational</div>
+      </aside>
+
+      <div class="main-panel">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Revenue operations</p>
+            <h1>Revenue Recovery</h1>
+          </div>
+
+          <div class="topbar-tools">
+            <div class="refresh-wrap">
+              <span class="muted-text">Last refreshed</span>
+              <strong id="lastRefreshText">--</strong>
+            </div>
+            <button id="refreshButton" class="button button-secondary">Refresh</button>
+            <button class="button button-primary batch-trigger" type="button">Run Batch Recovery</button>
+            <div class="status-pill">
+              <span class="status-indicator"></span>
+              Recovery Engine Operational
+            </div>
+          </div>
+        </header>
+
+        <main class="content">
+          <section id="overview" class="panel hero-panel">
+            <div class="hero-copy">
+              <p class="eyebrow">AI-powered recovery of failed payments with deterministic safety guardrails.</p>
+              <h2>Revenue Recovery</h2>
+            </div>
+
+            <div class="hero-meta">
+              <div class="meta-block">
+                <span class="meta-label">Cases processed</span>
+                <strong id="heroCasesProcessed">0</strong>
+              </div>
+              <div class="meta-block">
+                <span class="meta-label">Last refresh</span>
+                <strong id="heroLastRefresh">--</strong>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel manual-payment-card">
+            <div class="manual-payment-header">
+              <div>
+                <p class="eyebrow">Demo transaction</p>
+                <h3>Manual Payment Test</h3>
+              </div>
+              <span id="manualPaymentState" class="manual-state manual-state-idle">IDLE</span>
+            </div>
+
+            <div class="manual-payment-body">
+              <div>
+                <p class="manual-copy">Create a ₹500 Razorpay Checkout payment.</p>
+                <div class="manual-amount">₹500</div>
+              </div>
+              <button id="manualPaymentButton" class="button button-primary" type="button">Book Now</button>
+            </div>
+
+            <div id="manualPaymentResult" class="manual-result">No test payment started.</div>
+          </section>
+
+          <section class="kpi-grid" aria-label="Recovery KPI overview">
+            <article class="kpi-card emphasis">
+              <div class="kpi-header">
+                <span>Revenue At Risk</span>
+              </div>
+              <div id="revenueAtRisk" class="kpi-value">₹0</div>
+              <div class="kpi-caption">Current portfolio at risk</div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-header">
+                <span>Revenue Recovered</span>
+              </div>
+              <div id="revenueRecovered" class="kpi-value">₹0</div>
+              <div class="kpi-caption">Captured after recovery</div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-header">
+                <span>Recovery Rate</span>
+              </div>
+              <div id="recoveryRate" class="kpi-value">0.00%</div>
+              <div class="kpi-caption">Recovered revenue / risk</div>
+            </article>
+
+            <article class="kpi-card">
+              <div class="kpi-header">
+                <span>Recovery Cases</span>
+              </div>
+              <div id="totalRecoveryCases" class="kpi-value">0</div>
+              <div class="kpi-caption">Active tracked cases</div>
+            </article>
+
+            <article class="kpi-card secondary">
+              <div class="kpi-header">
+                <span>Recoverable Cases</span>
+              </div>
+              <div id="recoverableCases" class="kpi-value">0</div>
+              <div class="kpi-caption">AI-approved queue</div>
+            </article>
+
+            <article class="kpi-card secondary">
+              <div class="kpi-header">
+                <span>Recovered Cases</span>
+              </div>
+              <div id="recoveredCases" class="kpi-value">0</div>
+              <div class="kpi-caption">Payments successfully recovered</div>
+            </article>
+
+            <article class="kpi-card secondary">
+              <div class="kpi-header">
+                <span>Payment Links Created</span>
+              </div>
+              <div id="paymentLinksCreated" class="kpi-value">0</div>
+              <div class="kpi-caption">Recovery actions executed</div>
+            </article>
+
+            <article class="kpi-card secondary">
+              <div class="kpi-header">
+                <span>Recovery Actions Failed</span>
+              </div>
+              <div id="failedActions" class="kpi-value">0</div>
+              <div class="kpi-caption">Execution issues</div>
+            </article>
+          </section>
+
+          <section class="panel two-column-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Portfolio performance</p>
+                <h3>Recovery Funnel</h3>
+              </div>
+            </div>
+            <div id="recoveryFunnel" class="funnel-list"></div>
+          </section>
+
+          <section class="panel two-column-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">Portfolio distribution</p>
+                <h3>Recovery Outcome Distribution</h3>
+              </div>
+            </div>
+            <div id="distributionChart" class="distribution-chart"></div>
+          </section>
+
+          <section class="panel pipeline-panel">
+            <div class="panel-header">
+              <div>
+                <p class="eyebrow">System flow</p>
+                <h3>AI Recovery Pipeline</h3>
+              </div>
+            </div>
+            <div class="pipeline-grid">
+              <div class="pipeline-step">
+                <div class="step-icon">1</div>
+                <div>
+                  <div class="step-title">Payment Failed</div>
+                  <div class="step-copy">Failed transaction enters the recovery workflow.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">2</div>
+                <div>
+                  <div class="step-title">Context Builder</div>
+                  <div class="step-copy">Customer and payment context is assembled for review.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">3</div>
+                <div>
+                  <div class="step-title">AI Assessment</div>
+                  <div class="step-copy">The model evaluates probability, priority and recommended action.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">4</div>
+                <div>
+                  <div class="step-title">Policy Guardrail</div>
+                  <div class="step-copy">Deterministic rules stop unsafe or non-recoverable actions.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">5</div>
+                <div>
+                  <div class="step-title">Safe Executor</div>
+                  <div class="step-copy">Only approved actions reach the payment recovery workflow.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">6</div>
+                <div>
+                  <div class="step-title">Notification</div>
+                  <div class="step-copy">Customer communication is triggered when the action is valid.</div>
+                </div>
+              </div>
+              <div class="pipeline-connector">↓</div>
+              <div class="pipeline-step">
+                <div class="step-icon">7</div>
+                <div>
+                  <div class="step-title">Recovery Verified</div>
+                  <div class="step-copy">A successful captured-payment webhook confirms actual recovery.</div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section id="batch-recovery" class="panel">
+            <div class="section-header-row">
+              <div>
+                <p class="eyebrow">Portfolio action</p>
+                <h3>Batch Recovery</h3>
+              </div>
+              <button class="button button-primary batch-trigger" type="button">Run Batch Recovery</button>
+            </div>
+            <div class="batch-summary">
+              <div>
+                <span class="meta-label">Eligible cases</span>
+                <strong id="eligibleCaseCount">0</strong>
+              </div>
+              <div>
+                <span class="meta-label">Process</span>
+                <strong>Portfolio pipeline</strong>
+              </div>
+            </div>
+          </section>
+
+          <section id="recovery-cases" class="panel">
+            <div class="section-header-row">
+              <div>
+                <p class="eyebrow">Case queue</p>
+                <h3>Recovery Cases</h3>
+              </div>
+
+              <div class="table-controls">
+                <div class="filter-group" aria-label="Recovery case filters">
+                  <button class="chip active" data-filter="all">All</button>
+                  <button class="chip" data-filter="pending">Pending</button>
+                  <button class="chip" data-filter="recoverable">Recoverable</button>
+                  <button class="chip" data-filter="recovered">Recovered</button>
+                  <button class="chip" data-filter="failed">Failed</button>
+                  <button class="chip" data-filter="not_recoverable">Not Recoverable</button>
+                </div>
+
+                <div class="search-box-wrap">
+                  <input id="searchInput" type="search" placeholder="Search customer, payment or case" aria-label="Search recovery cases" />
+                </div>
+              </div>
+            </div>
+
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Payment</th>
+                    <th>Failure</th>
+                    <th>Revenue At Risk</th>
+                    <th>AI Probability</th>
+                    <th>AI Action</th>
+                    <th>Policy / Action Status</th>
+                    <th>Recovery Status</th>
+                    <th>View</th>
+                  </tr>
+                </thead>
+                <tbody id="caseTableBody"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section id="audit-trail" class="panel">
+            <div class="section-header-row">
+              <div>
+                <p class="eyebrow">Operations log</p>
+                <h3>Audit Trail</h3>
+              </div>
+            </div>
+            <div id="auditTrailList" class="audit-trail-list"></div>
+          </section>
+        </main>
+      </div>
     </div>
 
+    <div id="drawerBackdrop" class="drawer-backdrop"></div>
+    <aside id="detailDrawer" class="detail-drawer" aria-label="Recovery case details">
+      <div class="detail-header">
+        <div>
+          <p class="eyebrow">Recovery Case</p>
+          <h3 id="caseDetailTitle">Case details</h3>
+        </div>
+        <button id="closeDrawer" class="button button-secondary">Close</button>
+      </div>
+
+      <div class="detail-body">
+        <div id="caseDetailStatus" class="case-status-block"></div>
+        <div id="caseDetailContent"></div>
+      </div>
+    </aside>
+
+    <div id="toast" class="toast" aria-live="polite"></div>
+
     <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
-    <script>
-        const statusDiv = document.getElementById('status');
-        let keyId = '';
-
-        // Fetch key from server
-        fetch('/get-razorpay-key').then(res => res.json()).then(data => {
-            keyId = data.keyId;
-        });
-
-        function updateStatus(status, message) {
-            statusDiv.className = status;
-            statusDiv.innerText = `${status}: ${message}`;
-        }
-
-        document.getElementById('rzp-button1').onclick = async function (e) {
-            e.preventDefault();
-            
-            // Clear previous status
-            updateStatus('', 'Initiating payment...');
-            
-            try {
-                // 1. Create order on the server
-                const response = await fetch('/create-order', { method: 'POST' });
-                const order = await response.json();
-                
-                if (!order || !order.id) {
-                    updateStatus('FAILED', 'Could not create order on the server.');
-                    return;
-                }
-
-                // 2. Initialize Razorpay Checkout
-                const options = {
-                    "key": keyId, 
-                    "amount": order.amount, 
-                    "currency": "INR",
-                    "name": "Booking Demo",
-                    "description": "Test Transaction",
-                    "order_id": order.id, 
-                    "handler": async function (response) {
-                        // SUCCESS SCENARIO
-                        try {
-                            const verifyRes = await fetch('/verify-payment', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(response)
-                            });
-                            
-                            const verifyData = await verifyRes.json();
-                            
-                            if (verifyData.status === 'SUCCESS') {
-                                updateStatus('SUCCESS', 'Payment successful and verified!');
-                            } else {
-                                updateStatus('FAILED', 'Payment successful but verification failed.');
-                            }
-                        } catch (err) {
-                            // TIMEOUT / UNKNOWN SCENARIO
-                            // This could happen if the network drops right after payment success
-                            updateStatus('TIMEOUT', 'Payment status unknown. Could not reach server to verify.');
-                        }
-                    },
-                    "prefill": {
-                        "name": "Test User",
-                        "email": "test@example.com",
-                        "contact": "9999999999"
-                    },
-                    "theme": {
-                        "color": "#528FF0"
-                    },
-                    "modal": {
-                        "ondismiss": function() {
-                            // ABANDONED SCENARIO
-                            updateStatus('ABANDONED', 'User closed the checkout modal.');
-                        }
-                    }
-                };
-                
-                const rzp1 = new Razorpay(options);
-                
-                // FAILED SCENARIO
-                rzp1.on('payment.failed', function (response){
-                    console.error("Payment Failed:", response.error);
-                    updateStatus('FAILED', response.error.description || 'Payment Failed');
-                });
-                
-                rzp1.open();
-                
-            } catch (error) {
-                console.error("Error:", error);
-                updateStatus('FAILED', 'An error occurred while setting up the payment.');
-            }
-        }
-    </script>
-</body>
+    <script src="/app.js"></script>
+  </body>
 </html>
+
