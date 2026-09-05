@@ -1,0 +1,30 @@
+@import "tailwindcss";
+
+@theme {
+  --font-serif: 'Newsreader', Georgia, Cambria, 'Times New Roman', Times, serif;
+  --font-sans: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+}
+
+:root {
+  --editorial-bg: #FBFBF9;
+  --editorial-surface: #F4F4F1;
+  --editorial-border: #E5E5E2;
+  --editorial-subtle: #F0F0EE;
+  --editorial-text: #1A1A1A;
+  --editorial-muted: #666662;
+  --editorial-dim: #9A9A95;
+  --editorial-accent: #D44D2F;
+}
+
+body {
+  background-color: #FBFBF9;
+  color: #1A1A1A;
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::selection {
+  background-color: #E5E5E2;
+  color: #1A1A1A;
+}

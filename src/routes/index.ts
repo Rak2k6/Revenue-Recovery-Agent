@@ -3,6 +3,7 @@ import { webhookRouter } from './webhooks';
 import { paymentsRouter } from './payments';
 import { recoveryCasesRouter } from './recoveryCases';
 import { frontendRouter } from './frontend';
+import { customerStoreRouter } from './customerStore';
 
 /**
  * Mount all Milestone 1 routes onto the existing Express app.
@@ -17,5 +18,6 @@ export function mountRoutes(app: Application): void {
   app.use(webhookRouter);
   app.use(paymentsRouter);
   app.use(recoveryCasesRouter);
+  app.use(customerStoreRouter);
   app.use(frontendRouter);
 }

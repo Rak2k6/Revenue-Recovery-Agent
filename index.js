@@ -1,6 +1,9 @@
 // Enable TypeScript for new src/ modules without a build step
 require('ts-node').register({ transpileOnly: true, files: true });
 
+// Load the standard .env file first, while retaining credential.env for
+// existing local setups that have not migrated to the standard filename.
+require('dotenv').config();
 require('dotenv').config({ path: 'credential.env' });
 const express = require('express');
 const cors = require('cors');
