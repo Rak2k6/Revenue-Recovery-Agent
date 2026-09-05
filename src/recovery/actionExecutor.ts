@@ -3,6 +3,7 @@ import { prisma } from '../db/prismaClient';
 import { createPaymentLink } from '../integrations/razorpay/paymentLink';
 import { PolicyDecision } from './schemas/policyDecisionSchema';
 import { RecoveryContext } from './schemas/recoveryContextSchema';
+import { NotificationService, defaultNotificationService } from '../integrations/notifications/notificationService';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -56,23 +57,25 @@ function rejectedResult(
 // ---------------------------------------------------------------------------
 
 /**
- * Phase 2F Action Executor.
+ * Phase 2F / Phase 3D Action Executor.
  *
  * This executor ONLY accepts an already-approved PolicyDecision.
  * It does NOT call decisionEngine, policyGuardrail, Groq, or any LLM.
  * The Policy Engine is the authorisation boundary; the executor protects
  * against stale state and race conditions.
  *
- * @param recoveryCaseId  ID of the RecoveryCase to operate on.
- * @param policyDecision  Validated PolicyDecision from Phase 2E. If not
- *                        approved, no side effects occur.
- * @param context         The RecoveryContext used to produce the decision
- *                        (provides trusted amounts and customer flags).
+ * @param recoveryCaseId       ID of the RecoveryCase to operate on.
+ * @param policyDecision       Validated PolicyDecision from Phase 2E. If not
+ *                             approved, no side effects occur.
+ * @param context              The RecoveryContext used to produce the decision
+ *                             (provides trusted amounts and customer flags).
+ * @param notificationService Optional NotificationService for dependency injection.
  */
 export async function executeRecoveryAction(
   recoveryCaseId: string,
   policyDecision: PolicyDecision,
-  context: RecoveryContext
+  context: RecoveryContext,
+  notificationService: NotificationService = defaultNotificationService
 ): Promise<ExecutionResult> {
 
   // ── Guard 1: Policy rejection ─────────────────────────────────────────────
@@ -127,7 +130,7 @@ export async function executeRecoveryAction(
   const payment = recoveryCase.payment;
 
   // ── Idempotency check: already has a recovery link ────────────────────────
-  if (recoveryCase.recoveryLinkId && recoveryCase.recoveryLinkUrl) {
+  if (approvedAction === 'CREATE_PAYMENT_LINK' && recoveryCase.recoveryLinkId && recoveryCase.recoveryLinkUrl) {
     await logAudit(recoveryCaseId, 'ACTION_ALREADY_EXISTS', 'COMPLETED', {
       recoveryLinkId: recoveryCase.recoveryLinkId,
       recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
@@ -172,12 +175,7 @@ export async function executeRecoveryAction(
     return rejectedResult(recoveryCaseId, approvedAction, `Max recovery attempts exceeded.`);
   }
 
-  // ── SEND_RECOVERY_REMINDER (MVP) ──────────────────────────────────────────
-  // Only valid when an existing link is already present. The idempotency
-  // guard above handles the case where recoveryLinkId already exists and the
-  // LLM requested a reminder. If the executor reaches here for a reminder
-  // request but no link exists, the policy engine should have already blocked
-  // it; however we defensively handle it here too.
+  // ── SEND_RECOVERY_REMINDER (Phase 3D Integration) ─────────────────────────
   if (approvedAction === 'SEND_RECOVERY_REMINDER') {
     if (!recoveryCase.recoveryLinkUrl) {
       await logAudit(recoveryCaseId, 'ACTION_BLOCKED', 'SKIPPED', {
@@ -185,19 +183,83 @@ export async function executeRecoveryAction(
       });
       return rejectedResult(recoveryCaseId, approvedAction, 'No existing recovery link available for reminder.');
     }
-    // MVP: log that a reminder would be sent; no actual notification system.
-    await logAudit(recoveryCaseId, 'RECOVERY_REMINDER_NOTED', 'COMPLETED', {
-      message: 'Recovery reminder noted. No external notification system is configured in this MVP.',
-      existingRecoveryLinkUrl: recoveryCase.recoveryLinkUrl,
-    });
-    return {
-      success: true,
-      recoveryCaseId: recoveryCase.id,
-      action: approvedAction,
-      status: 'COMPLETED',
-      message: 'Recovery reminder acknowledged (no external notification in MVP).',
+
+    const recipientEmail = payment.customer?.email ?? null;
+    if (!recipientEmail) {
+      await prisma.recoveryCase.update({
+        where: { id: recoveryCase.id },
+        data: {
+          actionStatus: 'FAILED',
+        },
+      });
+
+      await logAudit(recoveryCaseId, 'RECOVERY_REMINDER_FAILED', 'FAILED', {
+        reason: 'Customer email missing from trusted payment record.',
+        recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+      });
+
+      return {
+        success: false,
+        recoveryCaseId: recoveryCase.id,
+        action: approvedAction,
+        status: 'FAILED',
+        error: 'Customer email missing from payment record.',
+      };
+    }
+
+    const notificationResult = await notificationService.sendRecoveryReminder({
+      recipientEmail,
+      recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+      paymentId: payment.id,
       revenueAtRisk: recoveryCase.revenueAtRisk,
-    };
+    });
+
+    if (notificationResult.success) {
+      await prisma.recoveryCase.update({
+        where: { id: recoveryCase.id },
+        data: {
+          actionStatus: 'COMPLETED',
+        },
+      });
+
+      await logAudit(recoveryCaseId, 'RECOVERY_REMINDER_SENT', 'COMPLETED', {
+        provider: notificationResult.provider,
+        messageId: notificationResult.messageId,
+        recipientEmail,
+        recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+      });
+
+      return {
+        success: true,
+        recoveryCaseId: recoveryCase.id,
+        action: approvedAction,
+        status: 'COMPLETED',
+        message: 'Recovery reminder notification sent successfully.',
+        revenueAtRisk: recoveryCase.revenueAtRisk,
+      };
+    } else {
+      await prisma.recoveryCase.update({
+        where: { id: recoveryCase.id },
+        data: {
+          actionStatus: 'FAILED',
+        },
+      });
+
+      await logAudit(recoveryCaseId, 'RECOVERY_REMINDER_FAILED', 'FAILED', {
+        provider: notificationResult.provider,
+        reason: notificationResult.error || 'Notification delivery failed.',
+        recipientEmail,
+        recoveryLinkUrl: recoveryCase.recoveryLinkUrl,
+      });
+
+      return {
+        success: false,
+        recoveryCaseId: recoveryCase.id,
+        action: approvedAction,
+        status: 'FAILED',
+        error: notificationResult.error || 'Failed to send recovery reminder notification.',
+      };
+    }
   }
 
   // ── CREATE_PAYMENT_LINK execution ─────────────────────────────────────────

@@ -34,6 +34,26 @@ recoveryCasesRouter.get('/recovery-cases', requireInternalKey, async (req: Reque
   res.json({ data, total, limit, offset });
 });
 
+import { getRecoveryMetrics } from '../recovery/recoveryMetrics';
+
+/**
+ * GET /recovery-cases/metrics
+ *
+ * Calculates aggregate recovery metrics directly from database records.
+ * Registered BEFORE /recovery-cases/:id to avoid matching "metrics" as an ID.
+ */
+recoveryCasesRouter.get('/recovery-cases/metrics', requireInternalKey, async (req: Request, res: Response) => {
+  try {
+    const metrics = await getRecoveryMetrics();
+    res.json(metrics);
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err?.message || 'Internal server error calculating recovery metrics.',
+    });
+  }
+});
+
 /** GET /recovery-cases/:id — single case with payment + full audit log */
 recoveryCasesRouter.get('/recovery-cases/:id', requireInternalKey, async (req: Request, res: Response) => {
   const recoveryCaseId = req.params.id as string;
@@ -123,10 +143,34 @@ recoveryCasesRouter.post('/recovery-cases/:id/assess', requireInternalKey, async
   });
 });
 
-import { executeRecoveryAction } from '../recovery/actionExecutor';
-import { buildRecoveryContext } from '../recovery/contextBuilder';
-import { decideWithLLM } from '../recovery/llmAgent';
-import { evaluateRecoveryPolicy } from '../recovery/policyEngine';
+import { runRecoveryPipeline } from '../recovery/recoveryPipeline';
+import { runRecoveryBatch, DEFAULT_BATCH_LIMIT } from '../jobs/recoveryBatchRunner';
+
+/**
+ * POST /recovery-cases/batch-run
+ *
+ * Runs the batch recovery pipeline over all eligible PENDING_ASSESSMENT cases.
+ * Registered BEFORE /recovery-cases/:id/execute so Express does not match the
+ * literal "batch-run" as an :id parameter.
+ *
+ * Request body (optional):
+ *   { "limit": 10 }
+ *
+ * If no limit is supplied the runner uses DEFAULT_BATCH_LIMIT.
+ */
+recoveryCasesRouter.post('/recovery-cases/batch-run', requireInternalKey, async (req: Request, res: Response) => {
+  const rawLimit = req.body?.limit;
+  const limit = typeof rawLimit === 'number' && rawLimit > 0 ? rawLimit : DEFAULT_BATCH_LIMIT;
+
+  try {
+    const summary = await runRecoveryBatch({ limit });
+    res.json(summary);
+  } catch (err: any) {
+    res.status(500).json({
+      error: err?.message || 'Internal server error during batch recovery run.',
+    });
+  }
+});
 
 /**
  * POST /recovery-cases/:id/execute
@@ -140,17 +184,7 @@ recoveryCasesRouter.post('/recovery-cases/:id/execute', requireInternalKey, asyn
   const recoveryCaseId = req.params.id as string;
 
   try {
-    // Phase 2C: Build validated RecoveryContext
-    const context = await buildRecoveryContext(recoveryCaseId);
-
-    // Phase 2D: Obtain LLM recommendation (always returns a valid decision — may be STOP fallback)
-    const llmDecision = await decideWithLLM(context);
-
-    // Phase 2E: Deterministic Policy Engine — authorises or stops the action
-    const policyDecision = evaluateRecoveryPolicy(context, llmDecision);
-
-    // Phase 2F: Execute only if approved
-    const result = await executeRecoveryAction(recoveryCaseId, policyDecision, context);
+    const { result, llmDecision, policyDecision } = await runRecoveryPipeline(recoveryCaseId);
 
     res.json({
       ...result,
@@ -172,31 +206,17 @@ recoveryCasesRouter.post('/recovery-cases/:id/execute', requireInternalKey, asyn
   }
 });
 
-/** GET /recovery-metrics — calculate recovery metrics */
+/** GET /recovery-metrics — calculate recovery metrics (backwards compatibility alias) */
 recoveryCasesRouter.get('/recovery-metrics', requireInternalKey, async (req: Request, res: Response) => {
-  const cases = await prisma.recoveryCase.findMany({
-    include: { payment: true },
-  });
-
-  let totalRevenueAtRisk = 0;
-  let totalRevenueRecovered = 0;
-
-  for (const c of cases) {
-    // Only count eligible revenue at risk (not NOT_RECOVERABLE or captured/refunded)
-    if (c.recoverabilityStatus !== 'NOT_RECOVERABLE' && c.payment.status === 'FAILED') {
-      totalRevenueAtRisk += c.revenueAtRisk;
-    }
-    if (c.recoverabilityStatus === 'RECOVERED') {
-      totalRevenueRecovered += c.amountRecovered;
-    }
+  try {
+    const metrics = await getRecoveryMetrics();
+    res.json(metrics);
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err?.message || 'Internal server error calculating recovery metrics.',
+    });
   }
-
-  const recoveryRate = totalRevenueAtRisk > 0 ? Number((totalRevenueRecovered / totalRevenueAtRisk).toFixed(4)) : 0;
-
-  res.json({
-    totalRevenueAtRisk,
-    totalRevenueRecovered,
-    recoveryRate,
-  });
 });
+
 

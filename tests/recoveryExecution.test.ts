@@ -450,4 +450,182 @@ describe('Milestone 3: Recovery Execution (Phase 2F)', () => {
       })
     );
   });
+
+  // ── Phase 3D Notification Tests ──────────────────────────────────────────
+
+  it('16. Approved reminder with existing link -> NotificationService called -> action COMPLETED', async () => {
+    const rc = makeMockCase({
+      recoveryLinkId: 'plink_existing',
+      recoveryLinkUrl: 'https://rzp.io/i/existing_link',
+      maxRecoveryAttempts: 3,
+      recoveryAttemptCount: 1,
+    });
+    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+    (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc, actionStatus: 'COMPLETED' });
+
+    const spyProvider = {
+      sendReminder: jest.fn().mockResolvedValue({
+        success: true,
+        provider: 'mock',
+        messageId: 'msg_rem_123',
+      }),
+    };
+    const { NotificationService } = require('../src/integrations/notifications/notificationService');
+    const customNotificationService = new NotificationService(spyProvider);
+
+    const reminderPolicy: PolicyDecision = {
+      schemaVersion: 1,
+      approved: true,
+      action: 'SEND_RECOVERY_REMINDER',
+      reason: 'Existing link available for follow up reminder.',
+      stopCondition: null,
+    };
+
+    const res = await executeRecoveryAction('case_123', reminderPolicy, makeContext(), customNotificationService);
+
+    expect(res.success).toBe(true);
+    expect(res.status).toBe('COMPLETED');
+    expect(spyProvider.sendReminder).toHaveBeenCalledWith({
+      recipientEmail: 'test@example.com',
+      recoveryLinkUrl: 'https://rzp.io/i/existing_link',
+      paymentId: 'pay_123',
+      revenueAtRisk: 50000,
+    });
+    expect(prisma.recoveryAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'RECOVERY_REMINDER_SENT',
+          status: 'COMPLETED',
+        }),
+      })
+    );
+    // recoveryAttemptCount must NOT be incremented for reminder
+    expect(prisma.recoveryCase.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.not.objectContaining({
+          recoveryAttemptCount: expect.anything(),
+        }),
+      })
+    );
+  });
+
+  it('17. Reminder without recovery link -> NotificationService is NOT called', async () => {
+    const rc = makeMockCase({
+      recoveryLinkId: null,
+      recoveryLinkUrl: null,
+    });
+    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+
+    const spyProvider = {
+      sendReminder: jest.fn(),
+    };
+    const { NotificationService } = require('../src/integrations/notifications/notificationService');
+    const customNotificationService = new NotificationService(spyProvider);
+
+    const reminderPolicy: PolicyDecision = {
+      schemaVersion: 1,
+      approved: true,
+      action: 'SEND_RECOVERY_REMINDER',
+      reason: 'Attempt reminder without link.',
+      stopCondition: null,
+    };
+
+    const res = await executeRecoveryAction('case_123', reminderPolicy, makeContext(), customNotificationService);
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe('SKIPPED');
+    expect(spyProvider.sendReminder).not.toHaveBeenCalled();
+    expect(prisma.recoveryAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'ACTION_BLOCKED',
+          status: 'SKIPPED',
+        }),
+      })
+    );
+  });
+
+  it('18. Policy rejection (approved=false) -> NotificationService is NOT called', async () => {
+    const spyProvider = {
+      sendReminder: jest.fn(),
+    };
+    const { NotificationService } = require('../src/integrations/notifications/notificationService');
+    const customNotificationService = new NotificationService(spyProvider);
+
+    const rejectedReminderPolicy: PolicyDecision = {
+      schemaVersion: 1,
+      approved: false,
+      action: 'SEND_RECOVERY_REMINDER',
+      reason: 'Policy rejected reminder.',
+      stopCondition: 'RISK_REJECTED',
+    };
+
+    const res = await executeRecoveryAction('case_123', rejectedReminderPolicy, makeContext(), customNotificationService);
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe('SKIPPED');
+    expect(spyProvider.sendReminder).not.toHaveBeenCalled();
+    expect(prisma.recoveryAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'EXECUTION_REJECTED',
+          status: 'SKIPPED',
+        }),
+      })
+    );
+  });
+
+  it('19. Notification failure -> action FAILED, audit created, amountRecovered unchanged, status != RECOVERED', async () => {
+    const rc = makeMockCase({
+      recoveryLinkId: 'plink_existing',
+      recoveryLinkUrl: 'https://rzp.io/i/existing_link',
+      maxRecoveryAttempts: 3,
+      amountRecovered: 0,
+      recoverabilityStatus: 'RECOVERABLE',
+    });
+    (prisma.recoveryCase.findUnique as jest.Mock).mockResolvedValue(rc);
+    (prisma.recoveryCase.update as jest.Mock).mockResolvedValue({ ...rc, actionStatus: 'FAILED' });
+
+    const failingProvider = {
+      sendReminder: jest.fn().mockResolvedValue({
+        success: false,
+        provider: 'mock',
+        error: 'Simulated email provider outage',
+      }),
+    };
+    const { NotificationService } = require('../src/integrations/notifications/notificationService');
+    const customNotificationService = new NotificationService(failingProvider);
+
+    const reminderPolicy: PolicyDecision = {
+      schemaVersion: 1,
+      approved: true,
+      action: 'SEND_RECOVERY_REMINDER',
+      reason: 'Existing link available for follow up reminder.',
+      stopCondition: null,
+    };
+
+    const res = await executeRecoveryAction('case_123', reminderPolicy, makeContext(), customNotificationService);
+
+    expect(res.success).toBe(false);
+    expect(res.status).toBe('FAILED');
+    expect(res.error).toBe('Simulated email provider outage');
+    expect(prisma.recoveryAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'RECOVERY_REMINDER_FAILED',
+          status: 'FAILED',
+        }),
+      })
+    );
+    // Ensure amountRecovered and recoverabilityStatus are unchanged in DB update call
+    expect(prisma.recoveryCase.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'case_123' },
+        data: {
+          actionStatus: 'FAILED',
+        },
+      })
+    );
+  });
 });
+
